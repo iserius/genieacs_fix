@@ -28,24 +28,47 @@ read confirm
 # === Update & install dependensi ===
 echo -e "${GREEN}📦 Memperbarui sistem & memasang dependensi...${NC}"
 apt update -y && apt upgrade -y
-apt install -y git curl gnupg apt-transport-https ca-certificates
+apt install -y git curl gnupg apt-transport-https ca-certificates software-properties-common
 
 # === Install Node.js 18 ===
 echo -e "${GREEN}📦 Menginstal Node.js 18...${NC}"
 curl -fsSL https://deb.nodesource.com/setup_18.x | bash -
 apt install -y nodejs build-essential
 
-# === Install MongoDB ===
-echo -e "${GREEN}📦 Menginstal MongoDB 4.4...${NC}"
-# Modern way: download key to /usr/share/keyrings
-curl -fsSL https://www.mongodb.org/static/pgp/server-4.4.asc | gpg --dearmor -o /usr/share/keyrings/mongodb-server-4.4.gpg
+# === Deteksi versi Ubuntu dan install MongoDB ===
+UBUNTU_CODENAME=$(lsb_release -cs)
+echo -e "${GREEN}📦 Menginstal MongoDB 7.0 untuk Ubuntu ${UBUNTU_CODENAME}...${NC}"
 
-# Add repository with signed-by option
-echo "deb [ arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-4.4.gpg ] https://repo.mongodb.org/apt/ubuntu focal/mongodb-org/4.4 multiverse" > /etc/apt/sources.list.d/mongodb-org-4.4.list
+# Download dan install GPG key
+curl -fsSL https://www.mongodb.org/static/pgp/server-7.0.asc | gpg --dearmor -o /usr/share/keyrings/mongodb-server-7.0.gpg
+
+# Add repository berdasarkan versi Ubuntu
+case "$UBUNTU_CODENAME" in
+    jammy)
+        echo "deb [ arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-7.0.gpg ] https://repo.mongodb.org/apt/ubuntu jammy/mongodb-org/7.0 multiverse" > /etc/apt/sources.list.d/mongodb-org-7.0.list
+        ;;
+    focal)
+        echo "deb [ arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-7.0.gpg ] https://repo.mongodb.org/apt/ubuntu focal/mongodb-org/7.0 multiverse" > /etc/apt/sources.list.d/mongodb-org-7.0.list
+        ;;
+    noble)
+        echo "deb [ arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-7.0.gpg ] https://repo.mongodb.org/apt/ubuntu noble/mongodb-org/7.0 multiverse" > /etc/apt/sources.list.d/mongodb-org-7.0.list
+        ;;
+    *)
+        echo -e "${YELLOW}⚠️  Versi Ubuntu tidak dikenali, mencoba jammy repository...${NC}"
+        echo "deb [ arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-7.0.gpg ] https://repo.mongodb.org/apt/ubuntu jammy/mongodb-org/7.0 multiverse" > /etc/apt/sources.list.d/mongodb-org-7.0.list
+        ;;
+esac
 
 apt update && apt install -y mongodb-org
 systemctl enable --now mongod
 sleep 2
+
+# Verifikasi MongoDB berjalan
+if systemctl is-active --quiet mongod; then
+    echo -e "${GREEN}✅ MongoDB berhasil diinstall dan berjalan${NC}"
+else
+    echo -e "${RED}❌ MongoDB gagal berjalan, periksa logs dengan: journalctl -u mongod${NC}"
+fi
 
 # === Install GenieACS (npm global) ===
 echo -e "${GREEN}📦 Menginstal GenieACS versi terbaru (npm)...${NC}"
@@ -70,13 +93,15 @@ for svc in cwmp nbi fs ui; do
 cat << EOF > /etc/systemd/system/genieacs-${svc}.service
 [Unit]
 Description=GenieACS ${svc^^}
-After=network.target
+After=network.target mongod.service
+Requires=mongod.service
 
 [Service]
 User=genieacs
 EnvironmentFile=/opt/genieacs/genieacs.env
 ExecStart=/usr/bin/genieacs-${svc}
 Restart=on-failure
+RestartSec=10
 
 [Install]
 WantedBy=multi-user.target
@@ -87,6 +112,16 @@ done
 systemctl daemon-reload
 systemctl enable --now genieacs-{cwmp,nbi,fs,ui}
 sleep 3
+
+# === Verifikasi services ===
+echo -e "${GREEN}📦 Memeriksa status services...${NC}"
+for svc in cwmp nbi fs ui; do
+    if systemctl is-active --quiet genieacs-${svc}; then
+        echo -e "${GREEN}✅ genieacs-${svc} berjalan${NC}"
+    else
+        echo -e "${RED}❌ genieacs-${svc} gagal berjalan${NC}"
+    fi
+done
 
 # === Tampilkan sukses instalasi ===
 echo -e "${GREEN}============================================================${NC}"
@@ -104,20 +139,31 @@ if [ "$restore_confirm" == "y" ]; then
     rm -rf /opt/genieacs-backup-full
     git clone https://github.com/egachanel2626-sketch/genieacs-backup-full.git
 
-    echo -e "${YELLOW}⏸️ Menghentikan service GenieACS...${NC}"
+    echo -e "${YELLOW}⏸️  Menghentikan service GenieACS...${NC}"
     systemctl stop genieacs-{cwmp,nbi,fs,ui}
 
     echo -e "${YELLOW}🔄 Merestore database GenieACS...${NC}"
     mongorestore --drop --db genieacs /opt/genieacs-backup-full/genieacs
 
-    echo -e "${YELLOW}▶️ Menjalankan kembali service GenieACS...${NC}"
+    echo -e "${YELLOW}▶️  Menjalankan kembali service GenieACS...${NC}"
     systemctl start genieacs-{cwmp,nbi,fs,ui}
+    sleep 3
+
+    # Verifikasi services setelah restore
+    echo -e "${GREEN}📦 Memeriksa status services setelah restore...${NC}"
+    for svc in cwmp nbi fs ui; do
+        if systemctl is-active --quiet genieacs-${svc}; then
+            echo -e "${GREEN}✅ genieacs-${svc} berjalan${NC}"
+        else
+            echo -e "${RED}❌ genieacs-${svc} gagal berjalan${NC}"
+        fi
+    done
 
     echo -e "${GREEN}============================================================${NC}"
     echo -e "${GREEN}✅ Restore parameter full berhasil dipasang.${NC}"
     echo -e "${YELLOW}Akses UI di: http://$local_ip:3000${NC}"
     echo -e "${GREEN}============================================================${NC}"
 else
-    echo -e "${YELLOW}⏭️ Restore parameter dilewati.${NC}"
+    echo -e "${YELLOW}⏭️  Restore parameter dilewati.${NC}"
     echo -e "${GREEN}============================================================${NC}"
 fi
