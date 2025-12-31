@@ -5,6 +5,14 @@ set -e
 GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; NC='\033[0m'
 local_ip=$(hostname -I | awk '{print $1}')
 
+# === Deteksi init system ===
+if ps -p 1 -o comm= | grep -q systemd; then
+    INIT_SYSTEM="systemd"
+else
+    INIT_SYSTEM="other"
+    echo -e "${YELLOW}⚠️  Systemd tidak terdeteksi. Menggunakan manual startup method.${NC}"
+fi
+
 # === Banner ===
 clear
 echo -e "${GREEN}============================================================${NC}"
@@ -17,6 +25,7 @@ echo -e "${GREEN}   +------+ +--ØØ-+ +-+  +-+     +-----++-+  +-++-+  +-+    $
 echo -e "${YELLOW}        GenieACS Auto Installer by EGA CHANEL ${NC}"
 echo -e "${GREEN}============================================================${NC}"
 echo -e "${GREEN}Ubuntu $(lsb_release -d | cut -f2) | IP: ${local_ip}${NC}"
+echo -e "${GREEN}Init System: ${INIT_SYSTEM}${NC}"
 echo -e "${GREEN}============================================================${NC}"
 sleep 2
 
@@ -65,7 +74,7 @@ esac
 
 apt update && apt install -y mongodb-org
 
-# Pin MongoDB version untuk mencegah auto-upgrade
+# Pin MongoDB version
 echo "mongodb-org hold" | dpkg --set-selections
 echo "mongodb-org-database hold" | dpkg --set-selections
 echo "mongodb-org-server hold" | dpkg --set-selections
@@ -73,28 +82,38 @@ echo "mongodb-mongosh hold" | dpkg --set-selections
 echo "mongodb-org-mongos hold" | dpkg --set-selections
 echo "mongodb-org-tools hold" | dpkg --set-selections
 
-systemctl enable --now mongod
-sleep 2
-
-# Verifikasi MongoDB berjalan
-if systemctl is-active --quiet mongod; then
-    MONGO_VERSION=$(mongod --version | head -n 1)
-    echo -e "${GREEN}✅ MongoDB berhasil diinstall dan berjalan${NC}"
-    echo -e "${GREEN}   ${MONGO_VERSION}${NC}"
+# === Start MongoDB berdasarkan init system ===
+if [ "$INIT_SYSTEM" = "systemd" ]; then
+    systemctl enable --now mongod
+    sleep 2
+    if systemctl is-active --quiet mongod; then
+        echo -e "${GREEN}✅ MongoDB berhasil diinstall dan berjalan (systemd)${NC}"
+    else
+        echo -e "${RED}❌ MongoDB gagal berjalan${NC}"
+    fi
 else
-    echo -e "${RED}❌ MongoDB gagal berjalan, periksa logs dengan: journalctl -u mongod${NC}"
+    echo -e "${YELLOW}📦 Menjalankan MongoDB secara manual...${NC}"
+    mkdir -p /var/lib/mongodb /var/log/mongodb
+    chown -R mongodb:mongodb /var/lib/mongodb /var/log/mongodb
+    
+    # Start MongoDB in background
+    sudo -u mongodb mongod --dbpath /var/lib/mongodb --logpath /var/log/mongodb/mongod.log --fork
+    sleep 2
+    
+    if pgrep -x mongod > /dev/null; then
+        echo -e "${GREEN}✅ MongoDB berhasil diinstall dan berjalan (manual)${NC}"
+    else
+        echo -e "${RED}❌ MongoDB gagal berjalan${NC}"
+    fi
 fi
 
 # === Install GenieACS (npm global) ===
 echo -e "${GREEN}📦 Menginstal GenieACS versi terbaru (npm)...${NC}"
 npm install -g genieacs
-
-# Verifikasi GenieACS version
-GENIEACS_VERSION=$(genieacs-cwmp --version 2>&1 || echo "installed")
 echo -e "${GREEN}✅ GenieACS berhasil diinstall${NC}"
 
 # === Membuat user & direktori ===
-useradd --system --no-create-home --user-group genieacs || true
+useradd --system --no-create-home --user-group genieacs 2>/dev/null || true
 mkdir -p /opt/genieacs/ext /var/log/genieacs
 chown -R genieacs:genieacs /opt/genieacs /var/log/genieacs
 
@@ -106,14 +125,14 @@ EOF
 chown genieacs:genieacs /opt/genieacs/genieacs.env
 chmod 600 /opt/genieacs/genieacs.env
 
-# === Systemd services ===
-echo -e "${GREEN}📦 Membuat service systemd...${NC}"
-for svc in cwmp nbi fs ui; do
-cat << EOF > /etc/systemd/system/genieacs-${svc}.service
+# === Setup services berdasarkan init system ===
+if [ "$INIT_SYSTEM" = "systemd" ]; then
+    echo -e "${GREEN}📦 Membuat systemd services...${NC}"
+    for svc in cwmp nbi fs ui; do
+    cat << EOF > /etc/systemd/system/genieacs-${svc}.service
 [Unit]
 Description=GenieACS ${svc^^}
-After=network.target mongod.service
-Requires=mongod.service
+After=network.target
 
 [Service]
 User=genieacs
@@ -125,33 +144,62 @@ RestartSec=10
 [Install]
 WantedBy=multi-user.target
 EOF
-done
+    done
 
-# === Enable & start all ===
-systemctl daemon-reload
-systemctl enable --now genieacs-{cwmp,nbi,fs,ui}
-sleep 3
+    systemctl daemon-reload
+    systemctl enable --now genieacs-{cwmp,nbi,fs,ui}
+    sleep 3
 
-# === Verifikasi services ===
-echo -e "${GREEN}📦 Memeriksa status services...${NC}"
-ALL_OK=true
-for svc in cwmp nbi fs ui; do
-    if systemctl is-active --quiet genieacs-${svc}; then
-        echo -e "${GREEN}✅ genieacs-${svc} berjalan${NC}"
-    else
-        echo -e "${RED}❌ genieacs-${svc} gagal berjalan${NC}"
-        ALL_OK=false
-    fi
-done
+    echo -e "${GREEN}📦 Memeriksa status services...${NC}"
+    for svc in cwmp nbi fs ui; do
+        if systemctl is-active --quiet genieacs-${svc}; then
+            echo -e "${GREEN}✅ genieacs-${svc} berjalan${NC}"
+        else
+            echo -e "${RED}❌ genieacs-${svc} gagal berjalan${NC}"
+        fi
+    done
+else
+    echo -e "${GREEN}📦 Membuat startup scripts untuk non-systemd...${NC}"
+    
+    # Create startup script
+    cat << 'EOF' > /usr/local/bin/genieacs-start
+#!/bin/bash
+source /opt/genieacs/genieacs.env
+sudo -u genieacs /usr/bin/genieacs-cwmp > /var/log/genieacs/genieacs-cwmp.log 2>&1 &
+sudo -u genieacs /usr/bin/genieacs-nbi > /var/log/genieacs/genieacs-nbi.log 2>&1 &
+sudo -u genieacs /usr/bin/genieacs-fs > /var/log/genieacs/genieacs-fs.log 2>&1 &
+sudo -u genieacs /usr/bin/genieacs-ui > /var/log/genieacs/genieacs-ui.log 2>&1 &
+echo "GenieACS services started"
+EOF
+
+    cat << 'EOF' > /usr/local/bin/genieacs-stop
+#!/bin/bash
+pkill -f genieacs-cwmp
+pkill -f genieacs-nbi
+pkill -f genieacs-fs
+pkill -f genieacs-ui
+echo "GenieACS services stopped"
+EOF
+
+    chmod +x /usr/local/bin/genieacs-start /usr/local/bin/genieacs-stop
+    
+    # Start services
+    /usr/local/bin/genieacs-start
+    sleep 3
+    
+    echo -e "${GREEN}📦 Memeriksa status services...${NC}"
+    for svc in cwmp nbi fs ui; do
+        if pgrep -f "genieacs-${svc}" > /dev/null; then
+            echo -e "${GREEN}✅ genieacs-${svc} berjalan${NC}"
+        else
+            echo -e "${RED}❌ genieacs-${svc} gagal berjalan${NC}"
+        fi
+    done
+fi
 
 # === Tampilkan sukses instalasi ===
 echo -e "${GREEN}============================================================${NC}"
-if [ "$ALL_OK" = true ]; then
-    echo -e "${GREEN}✅ Instalasi GenieACS by EGA CHANEL selesai.${NC}"
-else
-    echo -e "${YELLOW}⚠️  Instalasi selesai dengan beberapa warning${NC}"
-    echo -e "${YELLOW}   Periksa logs: journalctl -u genieacs-cwmp${NC}"
-fi
+echo -e "${GREEN}✅ Instalasi GenieACS by EGA CHANEL selesai.${NC}"
 echo -e "${YELLOW}Akses UI di: http://$local_ip:3000${NC}"
 echo -e "${GREEN}============================================================${NC}"
 
@@ -171,24 +219,41 @@ if [ "$restore_confirm" == "y" ]; then
     fi
 
     echo -e "${YELLOW}⏸️  Menghentikan service GenieACS...${NC}"
-    systemctl stop genieacs-{cwmp,nbi,fs,ui}
+    if [ "$INIT_SYSTEM" = "systemd" ]; then
+        systemctl stop genieacs-{cwmp,nbi,fs,ui}
+    else
+        /usr/local/bin/genieacs-stop
+    fi
 
     echo -e "${YELLOW}🔄 Merestore database GenieACS...${NC}"
     mongorestore --drop --db genieacs /opt/genieacs-backup-full/genieacs
 
     echo -e "${YELLOW}▶️  Menjalankan kembali service GenieACS...${NC}"
-    systemctl start genieacs-{cwmp,nbi,fs,ui}
+    if [ "$INIT_SYSTEM" = "systemd" ]; then
+        systemctl start genieacs-{cwmp,nbi,fs,ui}
+    else
+        /usr/local/bin/genieacs-start
+    fi
     sleep 3
 
-    # Verifikasi services setelah restore
     echo -e "${GREEN}📦 Memeriksa status services setelah restore...${NC}"
-    for svc in cwmp nbi fs ui; do
-        if systemctl is-active --quiet genieacs-${svc}; then
-            echo -e "${GREEN}✅ genieacs-${svc} berjalan${NC}"
-        else
-            echo -e "${RED}❌ genieacs-${svc} gagal berjalan${NC}"
-        fi
-    done
+    if [ "$INIT_SYSTEM" = "systemd" ]; then
+        for svc in cwmp nbi fs ui; do
+            if systemctl is-active --quiet genieacs-${svc}; then
+                echo -e "${GREEN}✅ genieacs-${svc} berjalan${NC}"
+            else
+                echo -e "${RED}❌ genieacs-${svc} gagal berjalan${NC}"
+            fi
+        done
+    else
+        for svc in cwmp nbi fs ui; do
+            if pgrep -f "genieacs-${svc}" > /dev/null; then
+                echo -e "${GREEN}✅ genieacs-${svc} berjalan${NC}"
+            else
+                echo -e "${RED}❌ genieacs-${svc} gagal berjalan${NC}"
+            fi
+        done
+    fi
 
     echo -e "${GREEN}============================================================${NC}"
     echo -e "${GREEN}✅ Restore parameter full berhasil dipasang.${NC}"
@@ -206,8 +271,17 @@ echo -e "${YELLOW}• GenieACS CWMP (TR-069): http://$local_ip:7547${NC}"
 echo -e "${YELLOW}• GenieACS NBI API: http://$local_ip:7557${NC}"
 echo -e "${YELLOW}• GenieACS FS: http://$local_ip:7567${NC}"
 echo -e "${GREEN}============================================================${NC}"
-echo -e "${GREEN}Perintah berguna:${NC}"
-echo -e "${YELLOW}• Cek status: systemctl status genieacs-{cwmp,nbi,fs,ui}${NC}"
-echo -e "${YELLOW}• Restart: systemctl restart genieacs-{cwmp,nbi,fs,ui}${NC}"
-echo -e "${YELLOW}• Logs: journalctl -u genieacs-cwmp -f${NC}"
+
+if [ "$INIT_SYSTEM" = "systemd" ]; then
+    echo -e "${GREEN}Perintah berguna (systemd):${NC}"
+    echo -e "${YELLOW}• Cek status: systemctl status genieacs-cwmp${NC}"
+    echo -e "${YELLOW}• Restart: systemctl restart genieacs-{cwmp,nbi,fs,ui}${NC}"
+    echo -e "${YELLOW}• Logs: journalctl -u genieacs-cwmp -f${NC}"
+else
+    echo -e "${GREEN}Perintah berguna (non-systemd):${NC}"
+    echo -e "${YELLOW}• Start: genieacs-start${NC}"
+    echo -e "${YELLOW}• Stop: genieacs-stop${NC}"
+    echo -e "${YELLOW}• Logs: tail -f /var/log/genieacs/genieacs-cwmp.log${NC}"
+    echo -e "${YELLOW}• Cek proses: ps aux | grep genieacs${NC}"
+fi
 echo -e "${GREEN}============================================================${NC}"
