@@ -30,10 +30,14 @@ echo -e "${GREEN}📦 Memperbarui sistem & memasang dependensi...${NC}"
 apt update -y && apt upgrade -y
 apt install -y git curl gnupg apt-transport-https ca-certificates software-properties-common
 
-# === Install Node.js 18 ===
-echo -e "${GREEN}📦 Menginstal Node.js 18...${NC}"
-curl -fsSL https://deb.nodesource.com/setup_18.x | bash -
+# === Install Node.js 20 LTS ===
+echo -e "${GREEN}📦 Menginstal Node.js 20 LTS...${NC}"
+curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
 apt install -y nodejs build-essential
+
+# Verifikasi Node.js version
+NODE_VERSION=$(node -v)
+echo -e "${GREEN}✅ Node.js ${NODE_VERSION} berhasil diinstall${NC}"
 
 # === Deteksi versi Ubuntu dan install MongoDB ===
 UBUNTU_CODENAME=$(lsb_release -cs)
@@ -60,12 +64,23 @@ case "$UBUNTU_CODENAME" in
 esac
 
 apt update && apt install -y mongodb-org
+
+# Pin MongoDB version untuk mencegah auto-upgrade
+echo "mongodb-org hold" | dpkg --set-selections
+echo "mongodb-org-database hold" | dpkg --set-selections
+echo "mongodb-org-server hold" | dpkg --set-selections
+echo "mongodb-mongosh hold" | dpkg --set-selections
+echo "mongodb-org-mongos hold" | dpkg --set-selections
+echo "mongodb-org-tools hold" | dpkg --set-selections
+
 systemctl enable --now mongod
 sleep 2
 
 # Verifikasi MongoDB berjalan
 if systemctl is-active --quiet mongod; then
+    MONGO_VERSION=$(mongod --version | head -n 1)
     echo -e "${GREEN}✅ MongoDB berhasil diinstall dan berjalan${NC}"
+    echo -e "${GREEN}   ${MONGO_VERSION}${NC}"
 else
     echo -e "${RED}❌ MongoDB gagal berjalan, periksa logs dengan: journalctl -u mongod${NC}"
 fi
@@ -73,6 +88,10 @@ fi
 # === Install GenieACS (npm global) ===
 echo -e "${GREEN}📦 Menginstal GenieACS versi terbaru (npm)...${NC}"
 npm install -g genieacs
+
+# Verifikasi GenieACS version
+GENIEACS_VERSION=$(genieacs-cwmp --version 2>&1 || echo "installed")
+echo -e "${GREEN}✅ GenieACS berhasil diinstall${NC}"
 
 # === Membuat user & direktori ===
 useradd --system --no-create-home --user-group genieacs || true
@@ -115,17 +134,24 @@ sleep 3
 
 # === Verifikasi services ===
 echo -e "${GREEN}📦 Memeriksa status services...${NC}"
+ALL_OK=true
 for svc in cwmp nbi fs ui; do
     if systemctl is-active --quiet genieacs-${svc}; then
         echo -e "${GREEN}✅ genieacs-${svc} berjalan${NC}"
     else
         echo -e "${RED}❌ genieacs-${svc} gagal berjalan${NC}"
+        ALL_OK=false
     fi
 done
 
 # === Tampilkan sukses instalasi ===
 echo -e "${GREEN}============================================================${NC}"
-echo -e "${GREEN}✅ Instalasi GenieACS by EGA CHANEL selesai.${NC}"
+if [ "$ALL_OK" = true ]; then
+    echo -e "${GREEN}✅ Instalasi GenieACS by EGA CHANEL selesai.${NC}"
+else
+    echo -e "${YELLOW}⚠️  Instalasi selesai dengan beberapa warning${NC}"
+    echo -e "${YELLOW}   Periksa logs: journalctl -u genieacs-cwmp${NC}"
+fi
 echo -e "${YELLOW}Akses UI di: http://$local_ip:3000${NC}"
 echo -e "${GREEN}============================================================${NC}"
 
@@ -138,6 +164,11 @@ if [ "$restore_confirm" == "y" ]; then
     cd /opt
     rm -rf /opt/genieacs-backup-full
     git clone https://github.com/egachanel2626-sketch/genieacs-backup-full.git
+
+    if [ ! -d "/opt/genieacs-backup-full/genieacs" ]; then
+        echo -e "${RED}❌ Direktori backup tidak ditemukan!${NC}"
+        exit 1
+    fi
 
     echo -e "${YELLOW}⏸️  Menghentikan service GenieACS...${NC}"
     systemctl stop genieacs-{cwmp,nbi,fs,ui}
@@ -167,3 +198,16 @@ else
     echo -e "${YELLOW}⏭️  Restore parameter dilewati.${NC}"
     echo -e "${GREEN}============================================================${NC}"
 fi
+
+echo -e "${GREEN}============================================================${NC}"
+echo -e "${GREEN}Informasi Penting:${NC}"
+echo -e "${YELLOW}• GenieACS UI: http://$local_ip:3000${NC}"
+echo -e "${YELLOW}• GenieACS CWMP (TR-069): http://$local_ip:7547${NC}"
+echo -e "${YELLOW}• GenieACS NBI API: http://$local_ip:7557${NC}"
+echo -e "${YELLOW}• GenieACS FS: http://$local_ip:7567${NC}"
+echo -e "${GREEN}============================================================${NC}"
+echo -e "${GREEN}Perintah berguna:${NC}"
+echo -e "${YELLOW}• Cek status: systemctl status genieacs-{cwmp,nbi,fs,ui}${NC}"
+echo -e "${YELLOW}• Restart: systemctl restart genieacs-{cwmp,nbi,fs,ui}${NC}"
+echo -e "${YELLOW}• Logs: journalctl -u genieacs-cwmp -f${NC}"
+echo -e "${GREEN}============================================================${NC}"
